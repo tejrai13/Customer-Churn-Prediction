@@ -1,0 +1,309 @@
+---
+title: "DS 740 Final Project: Teleco Customer Churn"
+author: "Tej Rai"
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(caret)
+library(xgboost)
+```
+
+```{r}
+# Load the dataset
+data <- read.csv("Telco-Customer-Churn.csv")
+
+# Display the first few rows
+head(data)
+```
+
+```{r}
+#Overview of Data
+summary(data)
+
+str(data)
+```
+#Data Preperation & Cleaning 
+
+```{r}
+# Display rows where TotalCharges is NA
+na_totalcharges <- data %>%
+  filter(is.na(as.numeric(TotalCharges)))
+
+# Print the rows with NA in TotalCharges
+print(na_totalcharges)
+```
+```{r}
+#We can see 11 rows have missing TotalCharges, and those rows also have 0 Tenure despite having monthly charges
+#Drop these rows (since it is only 11 rows of 7043, it won't have a significant impact on the data)
+#Drop 'customerID' column since it isn't a meaningful for analysis 
+
+# Filter out rows where TotalCharges is NA
+data <- data %>%
+  filter(!is.na(TotalCharges))
+
+# Remove the customerID column
+data <- data %>%
+  select(-customerID)
+
+str(data)
+```
+```{r}
+#Handling Categorical Variables
+
+# Separate the target variable
+target <- data$Churn
+data <- data %>% select(-Churn)
+
+# One-hot encode categorical variables
+data_dummy <- dummyVars("~ .", data = data)
+data_encoded <- data.frame(predict(data_dummy, newdata = data))
+
+# Add the target variable back to the dataset
+data_encoded$Churn <- target
+
+# Ensure Churn is a factor for modeling
+data_encoded$Churn <- factor(data_encoded$Churn, levels = c("No", "Yes"))
+
+# Display the structure of the encoded dataset
+str(data_encoded)
+```
+#Fitting the models
+
+```{r}
+#Single layer of validation with 10-fold-CV for XGBoost
+
+# Set seed
+set.seed(123)
+
+# Define the train control for cross-validation
+ctrl <- trainControl(method = "cv", number = 10)
+
+# Train the XGBoost model with cross-validation
+fit_xgb <- train(Churn ~ ., 
+                 data = data_encoded,
+                 method = "xgbTree",
+                 tuneGrid = expand.grid(nrounds = c(15, 25, 50, 100), max_depth = 1:3, 
+                                        eta = 0.3, 
+                                        gamma = 0, 
+                                        colsample_bytree = 0.8, 
+                                        min_child_weight = 1, 
+                                        subsample = 1),
+                 verbosity = 0, 
+                 trControl = ctrl)
+
+fit_xgb
+```
+
+
+```{r}
+#Single layer of validation with 10-fold-CV for ANN
+
+# Set seed
+set.seed(100)
+
+# Define the train control for cross-validation
+ctrl <- trainControl(method = "cv", number = 10)
+
+tune_grid <- expand.grid(size = 1:5, decay = c(0, 0.01, 0.1, 0.2, 0.3, 0.5))
+
+# Train the neural network model with cross-validation
+fit_ann <- train(Churn ~ ., 
+                 data = data_encoded,
+                 method = "nnet",
+                 tuneGrid = tune_grid,
+                 preProc = c("center", "scale"),
+                 linout = FALSE,  # Set to FALSE for classification tasks
+                 maxit = 2000,
+                 trace = FALSE,
+                 trControl = ctrl)
+
+fit_ann
+```
+
+```{r}
+#Outer Layer of validation 
+
+# Set seed for reproducibility
+set.seed(100)
+
+# Number of outer folds
+n_outer_folds = 5
+
+# Ensure the target variable is a factor
+data_encoded$Churn = factor(data_encoded$Churn, levels = c("No", "Yes"))
+
+# Initialize the cv_pred to store predictions
+cv_pred_xgb = factor(vector(length = nrow(data_encoded)), levels = levels(data_encoded$Churn))
+cv_pred_ann = factor(vector(length = nrow(data_encoded)), levels = levels(data_encoded$Churn))
+
+# Create groups for outer folds
+groups = rep(1:n_outer_folds, length = nrow(data_encoded))
+cv_groups = sample(groups, nrow(data_encoded))
+
+# Outer loop for double cross-validation
+for (ii in 1:n_outer_folds) {
+  in_test = (cv_groups == ii)
+  in_train = (cv_groups != ii)
+  
+  # Define the train control for cross-validation
+  ctrl = trainControl(method = "cv", number = 10)
+  
+  # XGBoost Model
+  fit_xgb_DCV = train(Churn ~ ., 
+                      data = data_encoded[in_train, ],
+                      method = "xgbTree",
+                      tuneGrid = expand.grid(nrounds = c(15, 25, 50, 100), 
+                                             max_depth = 1:3, 
+                                             eta = 0.3, 
+                                             gamma = 0, 
+                                             colsample_bytree = 0.8, 
+                                             min_child_weight = 1, 
+                                             subsample = 1),
+                      verbosity = 0, 
+                      trControl = ctrl)
+  
+  # ANN Model
+  fit_ann_DCV = train(Churn ~ ., 
+                      data = data_encoded[in_train, ],
+                      method = "nnet",
+                      tuneGrid = expand.grid(size = 1:5, 
+                                             decay = c(0, 0.01, 0.1, 0.2, 0.3, 0.5)),
+                      preProc = c("center", "scale"),
+                      linout = FALSE,  # Set to FALSE for classification tasks
+                      maxit = 2000,
+                      trace = FALSE,
+                      trControl = ctrl)
+  
+  # Predictions for XGBoost
+  cv_pred_xgb[in_test] = predict(fit_xgb_DCV, newdata = data_encoded[in_test, ])
+  
+  # Predictions for ANN
+  cv_pred_ann[in_test] = predict(fit_ann_DCV, newdata = data_encoded[in_test, ])
+}
+
+# Print the confusion matrix for XGBoost
+confusionMatrix(cv_pred_xgb, data_encoded$Churn)
+
+# Print the confusion matrix for ANN
+confusionMatrix(cv_pred_ann, data_encoded$Churn)
+
+```
+
+```{r}
+# Extract the final model
+final_ann_model <- fit_ann_DCV$finalModel
+
+# Print the final model summary
+final_ann_model
+```
+
+```{r}
+#ROC Curve
+
+library(pROC)
+
+# Generate predictions
+predictions <- predict(final_ann_model, newdata = data_encoded, type = "prob")
+
+# Extract the probabilities for the positive class (churn = Yes)
+probabilities <- predictions[, "Yes"]
+
+# Actual classes
+actual_classes <- data_encoded$Churn
+
+# Calculate the ROC curve
+roc_curve <- roc(actual_classes, probabilities)
+
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve for ANN Model")
+
+# Calculate and print the AUC
+auc_value <- auc(roc_curve)
+print(paste("AUC:", auc_value))
+```
+
+
+#Interpreting the model
+
+```{r}
+#Visualize Confusion Matrix
+predictions <- predict(final_ann_model, newdata = data_encoded)
+
+# Generate the confusion matrix
+conf_matrix <- confusionMatrix(predictions, data_encoded$Churn)
+
+# Print the confusion matrix
+print(conf_matrix)
+
+# Create a function to visualize the confusion matrix
+visualize_confusion_matrix <- function(conf_matrix) {
+  # Convert the confusion matrix table to a data frame
+  cm_data <- as.data.frame(conf_matrix$table)
+  
+  # Plot the confusion matrix using ggplot2
+  ggplot(cm_data, aes(x = Reference, y = Prediction)) +
+    geom_tile(aes(fill = Freq), color = "white") +
+    scale_fill_gradient(low = "white", high = "blue") +
+    geom_text(aes(label = Freq), vjust = 1) +
+    theme_minimal() +
+    labs(title = "Confusion Matrix", x = "Actual", y = "Predicted")
+}
+
+# Visualize the confusion matrix
+visualize_confusion_matrix(conf_matrix)
+```
+
+
+```{r}
+#Variable Importance
+
+# Calculate variable importance using varImp
+var_imp <- varImp(fit_ann_DCV$finalModel)
+
+print(var_imp)
+```
+
+
+```{r}
+#Olden Plot
+
+library(NeuralNetTools)
+
+# Generate the Olden plot for the final model
+olden_plot <- olden(fit_ann_DCV$finalModel, bar_plot = TRUE)
+
+# Adjust the x-axis labels using ggplot2 functions
+olden_plot + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Olden Plot for the Final Model") +
+  xlab("Variables") +
+  ylab("Importance")
+```
+
+
+
+```{r}
+# Define the training control for cross-validation
+ctrl <- trainControl(method = "cv", number = 5)
+
+# Re-fit the model with the best parameters (size = 1, decay = 0.3)
+# Using the entire dataset to fit the final model
+final_ann_model <- train(Churn ~ ., 
+                         data = data_encoded,
+                         method = "nnet",
+                         tuneGrid = expand.grid(size = 1, decay = 0.3),
+                         preProc = c("center", "scale"),
+                         linout = FALSE,
+                         maxit = 2000,
+                         trace = FALSE,
+                         trControl = ctrl)
+
+# Specify the four important variables
+important_vars <- c("TotalCharges", "tenure")
+
+# Generate and display the Lek profile for the selected important variables
+lekprofile(final_ann_model, xsel = important_vars)
+```
